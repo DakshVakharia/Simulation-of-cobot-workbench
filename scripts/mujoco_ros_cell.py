@@ -79,7 +79,8 @@ from mujoco_rgbd_node import (  # noqa: E402
     ORBBEC, render_rgbd, mujoco_cam_to_ros_optical, mat_to_quat,
     make_camera_info, COLOR_OPTICAL_FRAME, DEPTH_OPTICAL_FRAME,
 )
-from scene import compile_scene_model, apply_environment_only  # noqa: E402
+from depth_noise import DepthNoiseConfig, apply_depth_noise  # noqa: E402
+from scene import compile_scene_model, apply_environment_only, ROBOT_BASE_POS  # noqa: E402
 
 
 ROBOT_RATE = 125.0        # Hz, matches mujoco_robot_sim.PUBLISH_RATE
@@ -121,7 +122,13 @@ WORLD_YAW_180_Z = True
 def _world_to_base_link(pos, rot_mat):
     """Re-express a MuJoCo world-frame position + 3x3 rotation matrix as
     though the world were yawed 180 degrees about Z before being called
-    base_link. See WORLD_YAW_180_Z above."""
+    base_link. See WORLD_YAW_180_Z above.
+
+    The robot is mounted at ROBOT_BASE_POS in the MuJoCo world (not the
+    origin), and base_link is the ROBOT's frame, so positions are first made
+    relative to the mount. Rotation is unaffected (the mount is a pure
+    translation)."""
+    pos = np.asarray(pos) - ROBOT_BASE_POS
     if not WORLD_YAW_180_Z:
         return pos, rot_mat
     rz180 = np.diag([-1.0, -1.0, 1.0])
@@ -262,6 +269,13 @@ def run_node(show_viewer=False):
 
     camera_rate = float(rospy.get_param("~camera_rate", DEFAULT_CAMERA_RATE))
     env_only = bool(rospy.get_param("~env_only", False))
+    noise_cfg = None
+    if bool(rospy.get_param("~depth_noise", False)):
+        noise_cfg = DepthNoiseConfig(
+            sigma_scale=float(rospy.get_param("~depth_noise_sigma_scale", 1.0)),
+            bias_mm=float(rospy.get_param("~depth_noise_bias_mm", 0.0)))
+        noise_rng = np.random.default_rng(rospy.get_param("~depth_noise_seed", None))
+        rospy.loginfo("depth noise ON: %s", noise_cfg)
 
     model = build_model()
     data = mujoco.MjData(model)
@@ -388,6 +402,9 @@ def run_node(show_viewer=False):
 
                 cam_stamp = rospy.Time.now()
 
+                if noise_cfg is not None:
+                    depth, invalid = apply_depth_noise(
+                        depth, invalid, ORBBEC.fx, noise_rng, noise_cfg)
                 depth_mm = np.where(invalid, 0, depth * 1000.0)
                 depth_mm = np.clip(depth_mm, 0, 65535).astype(np.uint16)
 

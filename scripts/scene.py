@@ -59,6 +59,14 @@ omitting it (as a first pass here did) leaves data.ctrl at its zero default
 while qpos starts at home, so the position actuators immediately drag the
 arm from home back toward qpos=0, sweeping it through the tabletop clutter
 during the very stability check meant to prove the clutter is undisturbed.
+
+ROBOT PLACEMENT: the UR5e sits at ROBOT_BASE_XY (the +x end of the table, far
+from the human at the -x end), not at the world origin. The vendored
+ur5e.xml's <body name="base" quat="0 0 0 -1"> has no pos, so _compile_model()
+injects one into the same scratch copy it already writes for the keyframe
+strip. Anything that treats "base_link" as the robot frame must subtract
+ROBOT_BASE_POS from world coordinates first (mujoco_ros_cell does, for the
+camera TF).
 """
 
 import re
@@ -97,7 +105,8 @@ HOME_QPOS_ROBOT = "-1.5708 -1.5708 1.5708 -1.5708 -1.5708 0"
 # "everything but the environment" is one array write, not per-geom logic.
 #
 #   group 0  ENVIRONMENT   table, wall, monitor, floor -- never move
-#   group 1  CLUTTER       glass, bottle, blocks, ChArUco board
+#   group 1  CLUTTER       glass, bottle, blocks, tray, screwdriver, car, human,
+#                          ChArUco board -- anything that is NOT static background
 #   group 2  robot visual  (from the vendored ur5e.xml, untouched)
 #   group 3  robot collision (from the vendored ur5e.xml, untouched)
 #   group 4  robot sites     (from the vendored ur5e.xml, untouched)
@@ -108,6 +117,13 @@ GROUP_CLUTTER = 1
 GROUP_ROBOT_VISUAL = 2
 
 ENV_ONLY_TOGGLE_KEY = "E"
+
+
+# Robot mount: the +x end of the table, where block_flat used to sit next to
+# the ChArUco board (board spans x 0.25..0.54; the base pedestal is ~0.09 m
+# radius, and the table edge is at x = 0.80). The human is at the -x end.
+ROBOT_BASE_XY = (0.68, 0.0)
+ROBOT_BASE_POS = np.array([ROBOT_BASE_XY[0], ROBOT_BASE_XY[1], 0.0])
 
 
 # ----------------------------------------------------------------------
@@ -168,21 +184,63 @@ MONITOR_HALF_Z = 0.125
 MONITOR_POS_XY = (0.0, 0.45)
 MONITOR_RGBA = "0.08 0.08 0.09 1"
 
-# Several blocks of differing sizes -- (half_x, half_y, half_z), xy position, colour.
+# Blocks of differing sizes (a third, block_flat, used to sit at (0.65, 0.0);
+# the robot took its place) -- (half_x, half_y, half_z), xy position, colour.
 BLOCK_SPECS = [
     dict(name="block_small", half=(0.060, 0.060, 0.060),
          pos_xy=(0.55, -0.35), rgba="0.85 0.25 0.20 1"),
     dict(name="block_medium", half=(0.080, 0.080, 0.080),
          pos_xy=(0.60, 0.35), rgba="0.95 0.55 0.10 1"),
-    dict(name="block_flat", half=(0.100, 0.060, 0.050),
-         pos_xy=(0.65, 0.0), rgba="0.55 0.25 0.75 1"),
 ]
+
+# ----------------------------------------------------------------------
+# Composite objects: each is ONE free body made of several geoms (so it moves
+# and collides as a rigid whole). All rest with their lowest point at z = 0.
+# The screwdriver's shaft is thinner than the 0.04 m rule above -- that rule
+# came from the removed distance-field code; the camera-side voxel filter is
+# now 5 mm, so it still survives as a recognisable strip of points.
+# ----------------------------------------------------------------------
+
+# Open-top tray: floor plate + four walls.
+TRAY_HALF = (0.090, 0.065)     # outer half-extents in x, y
+TRAY_HALF_HEIGHT = 0.030
+TRAY_WALL = 0.008
+TRAY_FLOOR = 0.008
+TRAY_POS_XY = (0.0, -0.20)
+TRAY_RGBA = "0.20 0.55 0.80 1"
+
+# Screwdriver lying on the table along x: octagonal handle (two boxes turned
+# 45 deg so it cannot roll), a shaft, a tip, and a flat blade.
+SCREWDRIVER_POS_XY = (-0.30, 0.30)
+SCREWDRIVER_HANDLE_HALF_LEN = 0.055
+SCREWDRIVER_HANDLE_HALF_W = 0.024    # across flats = 0.048
+SCREWDRIVER_SHAFT_LEN = 0.110
+SCREWDRIVER_SHAFT_RADIUS = 0.006
+SCREWDRIVER_HANDLE_RGBA = "0.85 0.15 0.15 1"
+SCREWDRIVER_SHAFT_RGBA = "0.72 0.72 0.75 1"
+
+# Toy car, nose toward +x: chassis, cabin, four wheels with axles along y.
+CAR_POS_XY = (0.15, -0.32)
+CAR_YAW_DEG = 20.0
+CAR_WHEEL_RADIUS = 0.022
+CAR_WHEEL_HALF_W = 0.008
+CAR_CHASSIS_HALF = (0.065, 0.030, 0.012)
+CAR_CABIN_HALF = (0.030, 0.026, 0.017)
+CAR_BODY_RGBA = "0.95 0.80 0.10 1"
+CAR_WHEEL_RGBA = "0.10 0.10 0.10 1"
+
+# Free bodies in declaration order -- the home keyframe's qpos block must
+# follow exactly this order (see build_scene_xml).
+CLUTTER_BODIES = ["glass", "bottle"] + [b["name"] for b in BLOCK_SPECS] + \
+                 ["tray", "screwdriver", "toy_car"]
+
 
 # ----------------------------------------------------------------------
 # Human figure, reaching for the bottle without touching it. Built as a
 # nested body chain (base -> pelvis -> shoulder -> elbow) with NO joints: it
-# is static scenery like the monitor (GROUP_ENV), so it can never tip or
-# drift into the bottle, but each body carries its own rotation, so posing
+# never moves (so it can never tip or drift into the bottle) but it is a
+# person, i.e. a dynamic obstacle: GROUP_CLUTTER, NOT GROUP_ENV, so env_only
+# hides it and the captured environment cloud never contains it. Each body carries its own rotation, so posing
 # it is just editing the angles below.
 #
 # TO POSE IT, edit only these HUMAN_* numbers (angles in degrees, all 0 =
@@ -399,6 +457,75 @@ def _blocks_xml(group):
     return "".join(blocks)
 
 
+def _tray_xml(group):
+    hx, hy = TRAY_HALF
+    H, w, F = TRAY_HALF_HEIGHT, TRAY_WALL, TRAY_FLOOR
+    x, y = TRAY_POS_XY
+    g = f'group="{group}" rgba="{TRAY_RGBA}"'
+    return f"""
+    <!-- Open tray: floor plate + four walls, one rigid body. -->
+    <body name="tray" pos="{x:.4f} {y:.4f} {H:.4f}">
+      <freejoint/>
+      <geom name="tray_floor" type="box" {g} pos="0 0 {-H + F / 2:.4f}" size="{hx:.4f} {hy:.4f} {F / 2:.4f}"/>
+      <geom name="tray_wall_px" type="box" {g} pos="{hx - w / 2:.4f} 0 0" size="{w / 2:.4f} {hy:.4f} {H:.4f}"/>
+      <geom name="tray_wall_nx" type="box" {g} pos="{-(hx - w / 2):.4f} 0 0" size="{w / 2:.4f} {hy:.4f} {H:.4f}"/>
+      <geom name="tray_wall_py" type="box" {g} pos="0 {hy - w / 2:.4f} 0" size="{hx - w:.4f} {w / 2:.4f} {H:.4f}"/>
+      <geom name="tray_wall_ny" type="box" {g} pos="0 {-(hy - w / 2):.4f} 0" size="{hx - w:.4f} {w / 2:.4f} {H:.4f}"/>
+    </body>"""
+
+
+def _screwdriver_xml(group):
+    x, y = SCREWDRIVER_POS_XY
+    L, a = SCREWDRIVER_HANDLE_HALF_LEN, SCREWDRIVER_HANDLE_HALF_W
+    t = a * np.tan(np.radians(22.5))
+    r = SCREWDRIVER_SHAFT_RADIUS
+    shaft_end = L + SCREWDRIVER_SHAFT_LEN
+    hq = lambda deg: " ".join(f"{v:.6f}" for v in _quat((1, 0, 0), deg))
+    hg = f'type="box" group="{group}" rgba="{SCREWDRIVER_HANDLE_RGBA}"'
+    sg = f'group="{group}" rgba="{SCREWDRIVER_SHAFT_RGBA}"'
+    # Regular octagon (apothem a) = union of four rectangles turned 0/45/90/135
+    # deg about the handle axis; resting on a flat face, so it cannot roll.
+    return f"""
+    <!-- Screwdriver lying along +x: octagonal handle, collar, shaft, flat blade. -->
+    <body name="screwdriver" pos="{x:.4f} {y:.4f} {a:.4f}">
+      <freejoint/>
+      <geom name="screwdriver_handle_0" {hg} size="{L:.4f} {a:.4f} {t:.4f}"/>
+      <geom name="screwdriver_handle_90" {hg} size="{L:.4f} {t:.4f} {a:.4f}"/>
+      <geom name="screwdriver_handle_45" {hg} quat="{hq(45)}" size="{L:.4f} {a:.4f} {t:.4f}"/>
+      <geom name="screwdriver_handle_135" {hg} quat="{hq(-45)}" size="{L:.4f} {a:.4f} {t:.4f}"/>
+      <geom name="screwdriver_collar" type="cylinder" {sg} fromto="{L:.4f} 0 0  {L + 0.012:.4f} 0 0" size="{r * 2:.4f}"/>
+      <geom name="screwdriver_shaft" type="cylinder" {sg} fromto="{L:.4f} 0 0  {shaft_end:.4f} 0 0" size="{r:.4f}"/>
+      <geom name="screwdriver_blade" type="box" {sg} pos="{shaft_end + 0.006:.4f} 0 0" size="0.008 {r * 1.5:.4f} {r * 0.8:.4f}"/>
+    </body>"""
+
+
+def _car_quat():
+    return _quat((0, 0, 1), CAR_YAW_DEG)
+
+
+def _car_xml(group):
+    x, y = CAR_POS_XY
+    R, W = CAR_WHEEL_RADIUS, CAR_WHEEL_HALF_W
+    ch, cb = CAR_CHASSIS_HALF, CAR_CABIN_HALF
+    chassis_z = 0.006
+    cabin_z = chassis_z + ch[2] + cb[2]
+    wheel_x, wheel_y = 0.042, ch[1] + W - 0.002
+    wq = "0.70710678 0.70710678 0 0"        # cylinder axis z -> y
+    wheels = "".join(f"""
+      <geom name="car_wheel_{n}" type="cylinder" group="{group}" rgba="{CAR_WHEEL_RGBA}"
+            pos="{sx * wheel_x:.4f} {sy * wheel_y:.4f} 0" quat="{wq}" size="{R:.4f} {W:.4f}"/>"""
+                     for n, sx, sy in (("fl", 1, 1), ("fr", 1, -1), ("rl", -1, 1), ("rr", -1, -1)))
+    return f"""
+    <!-- Toy car, nose toward +x (then yawed): chassis, cabin, 4 wheels. -->
+    <body name="toy_car" pos="{x:.4f} {y:.4f} {R:.4f}" quat="{' '.join(f'{v:.6f}' for v in _car_quat())}">
+      <freejoint/>
+      <geom name="car_chassis" type="box" group="{group}" rgba="{CAR_BODY_RGBA}"
+            pos="0 0 {chassis_z:.4f}" size="{ch[0]:.4f} {ch[1]:.4f} {ch[2]:.4f}"/>
+      <geom name="car_cabin" type="box" group="{group}" rgba="{CAR_BODY_RGBA}"
+            pos="-0.010 0 {cabin_z:.4f}" size="{cb[0]:.4f} {cb[1]:.4f} {cb[2]:.4f}"/>{wheels}
+    </body>"""
+
+
 def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
                      offwidth=None, offheight=None) -> str:
     """Return the full workcell MJCF as a string.
@@ -430,7 +557,9 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
     bottle_neck_center_z = bottle_body_top_z + BOTTLE_NECK_HALF_HEIGHT
 
     blocks_xml = _blocks_xml(GROUP_CLUTTER)
-    human_xml = _human_xml(GROUP_ENV)
+    composites_xml = (_tray_xml(GROUP_CLUTTER) + _screwdriver_xml(GROUP_CLUTTER)
+                      + _car_xml(GROUP_CLUTTER))
+    human_xml = _human_xml(GROUP_CLUTTER)
 
     include_xml = f'  <include file="{UR5E_NOKEY_NAME}"/>\n' if include_robot else ""
 
@@ -445,12 +574,19 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
     # module docstring for why the vendored keyframe cannot simply be reused.
     keyframe_xml = ""
     if include_robot:
+        identity = (1, 0, 0, 0)
         free_body_home = [
-            (GLASS_POS_XY[0], GLASS_POS_XY[1], GLASS_HALF_HEIGHT),
-            (bottle_x, bottle_y, BOTTLE_BODY_HALF_HEIGHT),
-        ] + [(spec["pos_xy"][0], spec["pos_xy"][1], spec["half"][2]) for spec in BLOCK_SPECS]
+            (GLASS_POS_XY[0], GLASS_POS_XY[1], GLASS_HALF_HEIGHT, identity),
+            (bottle_x, bottle_y, BOTTLE_BODY_HALF_HEIGHT, identity),
+        ] + [(spec["pos_xy"][0], spec["pos_xy"][1], spec["half"][2], identity)
+             for spec in BLOCK_SPECS] + [
+            (*TRAY_POS_XY, TRAY_HALF_HEIGHT, identity),
+            (*SCREWDRIVER_POS_XY, SCREWDRIVER_HANDLE_HALF_W, identity),
+            (*CAR_POS_XY, CAR_WHEEL_RADIUS, tuple(_car_quat())),
+        ]
         free_qpos = " ".join(
-            f"{x:.4f} {y:.4f} {z:.4f} 1 0 0 0" for x, y, z in free_body_home
+            f"{x:.4f} {y:.4f} {z:.4f} " + " ".join(f"{v:.6f}" for v in q)
+            for x, y, z, q in free_body_home
         )
         keyframe_xml = f"""
   <keyframe>
@@ -518,7 +654,7 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
     <!-- Human figure reaching for the bottle; pose via the HUMAN_* constants. -->
 {human_xml}
 
-    <site name="robot_mount" pos="0 0 0" size="0.035" rgba="0.9 0.2 0.2 1"/>
+    <site name="robot_mount" pos="{ROBOT_BASE_XY[0]} {ROBOT_BASE_XY[1]} 0" size="0.035" rgba="0.9 0.2 0.2 1"/>
 
     <camera name="depth_cam" pos="{CAMERA_POS[0]} {CAMERA_POS[1]} {CAMERA_POS[2]}"
             fovy="{camera_fovy}" mode="targetbody" target="table"/>
@@ -540,6 +676,7 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
             size="{BOTTLE_NECK_RADIUS:.4f} {BOTTLE_NECK_HALF_HEIGHT:.4f}" rgba="{BOTTLE_RGBA}"/>
     </body>
 {blocks_xml}
+{composites_xml}
 
     <!-- ChArUco board: hardcoded pose from the real rig's poses.yaml
          (aruco_1, parent base_link == this world origin). NOT a freejoint --
@@ -575,6 +712,10 @@ def _compile_model(xml: str, include_robot: bool) -> mujoco.MjModel:
     ur5e_text = UR5E_XML.read_text()
     ur5e_nokey = re.sub(r"<keyframe>.*?</keyframe>\s*", "", ur5e_text, flags=re.S)
     assert "<keyframe" not in ur5e_nokey, "failed to strip ur5e.xml's keyframe"
+    base_tag = '<body name="base" quat="0 0 0 -1"'
+    assert ur5e_nokey.count(base_tag) == 1, "ur5e.xml's base body tag changed"
+    ur5e_nokey = ur5e_nokey.replace(
+        base_tag, f'<body name="base" pos="{ROBOT_BASE_XY[0]} {ROBOT_BASE_XY[1]} 0" quat="0 0 0 -1"')
 
     nokey_path.write_text(ur5e_nokey)
     scratch.write_text(xml)
@@ -616,9 +757,18 @@ def apply_environment_only(scene_option, env_only: bool) -> None:
             scene_option.geomgroup[g] = 1
 
 
+def _geom_world_z_range(model, data, gid):
+    """World z-range of one geom, from its local AABB rotated into the world
+    (exact for boxes and axis-aligned cylinders/capsules, a tight bound
+    otherwise). Reads data.geom_xpos/xmat (post mj_forward), never
+    model.geom_pos, which is relative to the parent body."""
+    center = data.geom_xpos[gid] + data.geom_xmat[gid].reshape(3, 3) @ model.geom_aabb[gid][:3]
+    half_z = np.abs(data.geom_xmat[gid].reshape(3, 3)[2]) @ model.geom_aabb[gid][3:]
+    return center[2] - half_z, center[2] + half_z
+
+
 def describe(model, data):
-    """Print each geom's WORLD z-range. Must read data.geom_xpos (post
-    mj_forward), not model.geom_pos, which is relative to the parent body."""
+    """Print each geom's WORLD z-range."""
     mujoco.mj_forward(model, data)
 
     print(f"  bodies : {model.nbody}    geoms : {model.ngeom}    DOF : {model.nv}")
@@ -627,42 +777,29 @@ def describe(model, data):
     print("  " + "-" * 48)
     for i in range(model.ngeom):
         name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i) or f"<unnamed:{i}>"
-        gtype = mujoco.mjtGeom(model.geom_type[i]).name.replace("mjGEOM_", "")
-        cz = data.geom_xpos[i][2]
-        size = model.geom_size[i]
-        if gtype == "PLANE":
-            print(f"  {name:<19} z = {cz:+.3f} (infinite plane)")
+        if model.geom_type[i] == mujoco.mjtGeom.mjGEOM_PLANE:
+            print(f"  {name:<19} z = {data.geom_xpos[i][2]:+.3f} (infinite plane)")
             continue
-        elif gtype == "BOX":
-            hz = size[2]
-        elif gtype == "SPHERE":
-            hz = size[0]
-        elif gtype in ("CYLINDER", "ELLIPSOID"):
-            hz = size[1] if gtype == "CYLINDER" else size[2]
-        elif gtype == "CAPSULE":
-            hz = size[1] + size[0]
-        else:
-            hz = float(size.max())
-        print(f"  {name:<19} {cz - hz:+.3f} .. {cz + hz:+.3f}")
+        lo, hi = _geom_world_z_range(model, data, i)
+        print(f"  {name:<19} {lo:+.3f} .. {hi:+.3f}")
 
 
-CLUTTER_BOTTOM_GEOMS = ["glass_geom", "bottle_body_geom",
-                        "block_small_geom", "block_medium_geom", "block_flat_geom"]
+def _body_geoms(model, body_name):
+    bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    return [g for g in range(model.ngeom) if model.geom_bodyid[g] == bid]
 
 
-def _clutter_z_ranges(model, data):
-    """Return {geom_name: (z_min, z_max)} for the objects that must rest on
-    the table (bottle_neck excluded -- it does not touch the table itself)."""
-    out = {}
+def _clutter_table_gaps(model, data):
+    """{body: gap (m) between its lowest geom and the table top (z = 0)}.
+    0 = resting on the table."""
     mujoco.mj_forward(model, data)
-    for name in CLUTTER_BOTTOM_GEOMS:
-        gid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name)
-        cz = data.geom_xpos[gid][2]
-        gtype = mujoco.mjtGeom(model.geom_type[gid]).name.replace("mjGEOM_", "")
-        size = model.geom_size[gid]
-        hz = size[2] if gtype == "BOX" else size[1]
-        out[name] = (cz - hz, cz + hz)
-    return out
+    return {name: min(_geom_world_z_range(model, data, g)[0] for g in _body_geoms(model, name))
+            for name in CLUTTER_BODIES}
+
+
+def _clutter_heights(model, data):
+    return {n: float(data.xpos[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)][2])
+            for n in CLUTTER_BODIES}
 
 
 def _check_human(model, data):
@@ -716,18 +853,17 @@ def _check_robot(model, data):
     print("  end-effector z > 0  (OK -- arm is above the table, not buried in it)")
 
     print("\n  -- stability check: stepping 300 steps --")
-    before = _clutter_z_ranges(model, data)
+    before = _clutter_heights(model, data)
     for _ in range(300):
         mujoco.mj_step(model, data)
-    after = _clutter_z_ranges(model, data)
-    for name in CLUTTER_BOTTOM_GEOMS:
-        z0_min, _ = before[name]
-        z1_min, z1_max = after[name]
-        drift = z1_min - z0_min
-        print(f"  {name:<18} z_min before={z0_min:+.4f}  after={z1_min:+.4f}  "
+    after = _clutter_heights(model, data)
+    gaps = _clutter_table_gaps(model, data)
+    for name in CLUTTER_BODIES:
+        drift = after[name] - before[name]
+        print(f"  {name:<18} z before={before[name]:+.4f}  after={after[name]:+.4f}  "
               f"(drift {drift:+.4f})")
-        assert z1_min > -0.02, f"{name} sank through the table (z_min={z1_min:.4f})"
-        assert z1_max < 2.0, f"{name} appears to have exploded (z_max={z1_max:.4f})"
+        assert abs(drift) < 0.01 and gaps[name] > -0.01, (
+            f"{name} moved or sank through the table (drift {drift:+.4f}, gap {gaps[name]:+.4f})")
 
 
 def main():
@@ -741,13 +877,13 @@ def main():
     describe(model, data)
 
     print()
-    ranges = _clutter_z_ranges(model, data)
-    print("  clutter resting check (must start at +0.000):")
+    gaps = _clutter_table_gaps(model, data)
+    print("  clutter resting check (gap to table top must start at +0.000):")
     all_zero = True
-    for name, (zmin, zmax) in ranges.items():
-        ok = abs(zmin) < 1e-6
+    for name, gap in gaps.items():
+        ok = abs(gap) < 1e-6
         all_zero &= ok
-        print(f"    {name:<18} {zmin:+.4f} .. {zmax:+.4f}  {'OK' if ok else 'NOT ON TABLE'}")
+        print(f"    {name:<18} {gap:+.6f}  {'OK' if ok else 'NOT ON TABLE'}")
     assert all_zero, "at least one clutter object is not resting exactly at z=0"
 
     _check_human(model, data)

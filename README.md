@@ -240,6 +240,10 @@ file):
 |---|---|---|
 | `~camera_rate` | `15.0` Hz | how often the camera renders/publishes (robot loop is fixed at 125 Hz) |
 | `~env_only` | `false` | if true, published camera images hide clutter (arm + environment stay visible) — fixed at startup, no live toggle |
+| `~depth_noise` | `false` | apply the Femto Bolt noise model in `scripts/depth_noise.py` to the published depth (distance-dependent Gaussian, grazing-angle gain, flying pixels at edges, 0.5–3.86 m range clip) |
+| `~depth_noise_sigma_scale` | `1.0` | 1 = measured Azure Kinect noise (~0.5–1 mm); ~17–30 approaches the 17 mm datasheet ceiling |
+| `~depth_noise_bias_mm` | `0.0` | constant systematic offset (datasheet bound: 11 mm + 0.1 % of distance) |
+| `~depth_noise_seed` | random | fix for reproducible noise |
 
 ```bash
 rosrun mujoco_sim mujoco_ros_cell.py _camera_rate:=30 _env_only:=true
@@ -315,8 +319,6 @@ BLOCK_SPECS = [
          pos_xy=(0.55, -0.35), rgba="0.85 0.25 0.20 1"),
     dict(name="block_medium", half=(0.080, 0.080, 0.080),
          pos_xy=(0.60, 0.35), rgba="0.95 0.55 0.10 1"),
-    dict(name="block_flat", half=(0.100, 0.060, 0.050),
-         pos_xy=(0.65, 0.0), rgba="0.55 0.25 0.75 1"),
 ]
 ```
 `half` = half-extents, so a box's rendered size is **twice** these numbers —
@@ -337,6 +339,19 @@ BOTTLE_NECK_HALF_HEIGHT = 0.030
 BOTTLE_POS_XY = (-0.55, 0.15)
 BOTTLE_RGBA = "0.10 0.45 0.20 1"
 ```
+**Composite objects** — one free body made of several geoms, each with its own
+generator function and `*_POS_XY` / size constants in `scene.py`:
+
+| body | generator | what it is |
+|---|---|---|
+| `tray` | `_tray_xml` (`TRAY_*`) | open-top container: floor plate + four walls |
+| `screwdriver` | `_screwdriver_xml` (`SCREWDRIVER_*`) | octagonal handle (won't roll), collar, shaft, flat blade, lying along +x |
+| `toy_car` | `_car_xml` (`CAR_*`) | chassis, cabin, four wheels; `CAR_YAW_DEG` turns it |
+
+The screwdriver's shaft (12 mm across) is deliberately thinner than the
+0.04 m rule below — that rule came from the removed distance-field code, and
+the camera-side voxel filter is now 5 mm.
+
 To add a genuinely new *kind* of object (not just another
 block), copy the `<body>...</body>` block for `glass` or `bottle` inside
 `build_scene_xml()` as a template, give it a unique name and
@@ -347,7 +362,8 @@ smallest dimension must stay **≥ 0.04 m** — anything thinner disappears when
 voxelized for downstream distance-field processing.
 
 **If you add or remove any free-body clutter object**, you must also update
-the `free_body_home` list inside `build_scene_xml()` — it
+`CLUTTER_BODIES` (used by the checks) and the `free_body_home` list inside
+`build_scene_xml()` — it
 builds the scene's `"home"` keyframe, and its qpos entries must exactly match
 the free bodies actually declared, in declaration order, or the model will
 fail to compile ("expected length N, got M").
@@ -414,6 +430,18 @@ BOARD_QUAT_WXYZ = (0.0, 0.7071067811865476, 0.7071067811865475, 0.0)
 ```
 **Do not "fix" this pose casually** — it's copied verbatim
 from the real rig's calibration file, not derived geometrically.
+
+### 4.6b Robot mount position
+
+`ROBOT_BASE_XY = (0.68, 0.0)` in `scene.py` — the +x end of the table, next
+to the ChArUco board (where `block_flat` used to be), as far from the human
+(−x end) as the table allows. `_compile_model()` injects it as `pos` on
+ur5e.xml's `base` body. `base_link` in ROS is the *robot's* frame, so
+`mujoco_ros_cell._world_to_base_link` subtracts `ROBOT_BASE_POS` before
+publishing the camera TF. With the 180° world yaw that toggle applies,
+`base_link x = 0.68 − world x` and `base_link y = −world y`. If you move the
+robot, retune the sim crop box and `dimentions_sim.yaml` (§7.5) to match, and
+re-capture the environment cloud (§7.2).
 
 ### 4.7 Robot home pose
 
@@ -608,9 +636,13 @@ now, so retuning one never affects the other:
 | Real | `IDMP/config/cameraFilterChain.yaml` | `camera_startup.launch`'s `filter_chain` arg |
 
 The sim file's `CropBoxFilter` is sized for *this* sim's table (1.60×1.10 m,
-top at z=0): `x:[-1.2,1.2] y:[-0.7,0.58] z:[-0.05,1.0]`. `max_y=0.58`
-deliberately sits just inside the backdrop wall's near face (wall starts at
-y≈0.60) so the wall gets cropped along with the floor. If you resize the
+top at z=0), expressed in `base_link` (the robot's frame — see §4.6b):
+`x:[-0.3,2.3] y:[-0.58,0.7] z:[-0.05,1.0]`. The table spans base_link
+x∈[-0.12,1.48]; the human at the −x end lands at x≈1.6–2.1, which is why
+`max_x` is large. `min_y=-0.58` sits just inside the backdrop wall's near
+face (base_link y=-0.60) so the wall gets cropped along with the floor.
+`dimentions_sim.yaml` (table footprint for the clustering node) uses the same
+frame and must be kept in step. If you resize the
 table in `scene.py` (§4.1), retune the sim file's box to match — it will not
 resize itself. The real file's crop box is unchanged from the repo's
 original (a much wider, real-bench-sized box, with a small tighter
