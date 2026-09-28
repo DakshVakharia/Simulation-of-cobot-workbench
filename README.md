@@ -14,19 +14,17 @@ by `mujoco_ros_cell.py`, off the same camera pose as above:
 |---|---|
 | ![RGB camera topic](docs/rgb_topic.png) | ![Depth camera topic](docs/depth_topic.png) |
 
-<div style="position: sticky; top: 0; z-index: 100; background: #000000; padding: 6px; margin: 16px 0; border-radius: 6px; display: inline-flex; flex-wrap: wrap; gap: 6px; width: fit-content;">
-  <a href="#overview" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Overview</a>
-  <a href="#ros-interface" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">ROS interface</a>
-  <a href="#repository-layout" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Layout</a>
-  <a href="#quick-start" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Quick start</a>
-  <a href="#1-environment-setup" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Setup</a>
-  <a href="#2-source-commands" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Source commands</a>
-  <a href="#3-launch-commands" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Launch commands</a>
-  <a href="#4-where-to-change-scene-parameters" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Scene parameters</a>
-  <a href="#5-where-geometry-math-lives-if-you-need-to-touch-it" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Geometry math</a>
-  <a href="#6-quick-sanity-checks-after-any-scene-edit" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Sanity checks</a>
-  <a href="#7-full-simulation-with-idmp--rmp2" style="padding: 4px 10px; border-radius: 4px; color: #e6edf3; text-decoration: none; font-weight: 600; font-size: 13px;">Full stack + IDMP</a>
-</div>
+**[Overview](#overview) · [ROS interface](#ros-interface) · [Layout](#repository-layout) · [Quick start](#quick-start) · [Setup](#1-environment-setup) · [Source commands](#2-source-commands) · [Launch commands](#3-launch-commands) · [Scene parameters](#4-where-to-change-scene-parameters) · [Geometry math](#5-where-geometry-math-lives-if-you-need-to-touch-it) · [Sanity checks](#6-quick-sanity-checks-after-any-scene-edit) · [Full stack + IDMP](#7-full-simulation-with-idmp--rmp2)**
+
+## Highlights
+
+- **Hardware-in-the-loop without the hardware** — one ROS node publishes the same topics, services and TF as the real UR5e driver and Orbbec Femto Bolt camera, so the planner and perception stack run unmodified against the sim.
+- **One physics world** — arm and RGB-D camera are served from a single `MjModel`/`MjData`, so what the camera sees always matches where the arm is.
+- **Human-robot collaboration scenarios** — a human figure reaching into the shared workspace, with movable tabletop clutter, for testing collision avoidance safely.
+- **Realistic sensing** — Femto Bolt–style depth noise, correct optical-frame conventions and intrinsics.
+- **Self-testing** — every runnable script has a `--check` mode that verifies the model and ROS interface without launching anything.
+
+**Tech stack:** Python · MuJoCo 3 · ROS 1 Noetic · NumPy · trimesh · UR5e (MuJoCo Menagerie)
 
 ## Overview
 
@@ -115,7 +113,7 @@ gets exposed to ROS*. `scene.py` never imports `rospy`.
 ## Quick start
 
 ```bash
-git clone <this-repo> ~/Desktop/Simulation && cd ~/Desktop/Simulation
+git clone https://github.com/DakshVakharia/Simulation-For-IDMP.git ~/Desktop/Simulation && cd ~/Desktop/Simulation
 pip install -r requirements.txt
 
 # 1. Verify the scene compiles and is physically sane (no ROS needed)
@@ -716,9 +714,6 @@ Honest list of what this sim does *not* reproduce, and what is still open.
 - `WORLD_YAW_180_Z` in `mujoco_ros_cell.py` is an **unverified hypothesis
   fix** for a ~180° yaw mismatch seen in RViz (§7.5). It defaults to `True`
   and needs a live check.
-- `smoke_test.py` is broken — it calls `mujoco.viewer.launch()`, which no-ops
-  silently. Use `launch_passive()` with a manual stepping loop instead, as
-  every script in `scripts/` does.
 - There is no lint or test framework. Each module's `--check` flag *is* the
   test suite (§6).
 
@@ -728,3 +723,7 @@ The UR5e model in `assets/robots/ur5e/` is vendored from
 [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie)
 (see its own `LICENSE` and `PROVENANCE.md` in that directory for the upstream
 commit it came from). Re-fetch or update it with `python scripts/fetch_robot.py`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). The vendored UR5e model in `assets/robots/ur5e/` is from [MuJoCo Menagerie](https://github.com/google-deepmind/mujoco_menagerie) and keeps its own license ([assets/robots/ur5e/LICENSE](assets/robots/ur5e/LICENSE)).
