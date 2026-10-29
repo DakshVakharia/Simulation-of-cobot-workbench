@@ -80,7 +80,10 @@ from mujoco_rgbd_node import (  # noqa: E402
     make_camera_info, COLOR_OPTICAL_FRAME, DEPTH_OPTICAL_FRAME,
 )
 from depth_noise import DepthNoiseConfig, apply_depth_noise  # noqa: E402
-from scene import compile_scene_model, apply_environment_only, ROBOT_BASE_POS  # noqa: E402
+from scene import (  # noqa: E402
+    compile_scene_model, apply_environment_only, ROBOT_BASE_POS,
+    moving_cylinder_world_pos,
+)
 
 
 ROBOT_RATE = 125.0        # Hz, matches mujoco_robot_sim.PUBLISH_RATE
@@ -139,10 +142,12 @@ def _world_to_base_link(pos, rot_mat):
 # Model build + home seeding
 # ----------------------------------------------------------------------
 
-def build_model():
-    """Compile the single shared workcell, sized for the Orbbec renderer."""
+def build_model(scene="default"):
+    """Compile the single shared workcell, sized for the Orbbec renderer.
+    scene picks the clutter variant (scene.SCENES)."""
     return compile_scene_model(include_robot=True, camera_fovy=ORBBEC.fovy_deg,
-                                offwidth=ORBBEC.width, offheight=ORBBEC.height)
+                                offwidth=ORBBEC.width, offheight=ORBBEC.height,
+                                scene=scene)
 
 
 def seed_home(model, data, addrs, ctrl_ids):
@@ -269,6 +274,8 @@ def run_node(show_viewer=False):
 
     camera_rate = float(rospy.get_param("~camera_rate", DEFAULT_CAMERA_RATE))
     env_only = bool(rospy.get_param("~env_only", False))
+    scene = str(rospy.get_param("~scene", "default"))
+    rospy.loginfo("scene: %s", scene)
     noise_cfg = None
     if bool(rospy.get_param("~depth_noise", False)):
         noise_cfg = DepthNoiseConfig(
@@ -277,12 +284,18 @@ def run_node(show_viewer=False):
         noise_rng = np.random.default_rng(rospy.get_param("~depth_noise_seed", None))
         rospy.loginfo("depth noise ON: %s", noise_cfg)
 
-    model = build_model()
+    model = build_model(scene)
     data = mujoco.MjData(model)
 
     addrs = joint_addrs(model, JOINT_NAMES_NATIVE)
     ctrl_ids = actuator_for_joint_ids(model, [addrs[n][0] for n in JOINT_NAMES_NATIVE])
     seed_home(model, data, addrs, ctrl_ids)
+
+    # "moving_cylinder" only: a mocap body is posed by us, not by physics.
+    # Looked up once; the loop below writes its pose before every mj_step.
+    mocap_id = None
+    if scene == "moving_cylinder":
+        mocap_id = model.body_mocapid[model.body("cylinder_moving").id]
 
     jog = JogState()
 
@@ -355,6 +368,9 @@ def run_node(show_viewer=False):
 
             vel = jog.target_vel_native
             for _ in range(steps_per_frame):
+                if mocap_id is not None:
+                    # Sim time, not wall time, so the motion is deterministic.
+                    data.mocap_pos[mocap_id] = moving_cylinder_world_pos(data.time)
                 step_jog(model, data, ctrl_ids, vel)
 
             stamp = rospy.Time.now()

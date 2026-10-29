@@ -234,6 +234,75 @@ CAR_WHEEL_RGBA = "0.10 0.10 0.10 1"
 CLUTTER_BODIES = ["glass", "bottle"] + [b["name"] for b in BLOCK_SPECS] + \
                  ["tray", "screwdriver", "toy_car"]
 
+# ----------------------------------------------------------------------
+# Scene variants. "default" is the cluttered workcell above. "two_cylinders"
+# replaces ALL clutter (human figure and ChArUco board included) with two
+# tall static cylinders in front of the robot, for testing per-class
+# collision behaviour: the robot can be driven straight into either one.
+# "moving_cylinder" is two_cylinders plus a third, mocap-driven cylinder.
+# The environment (table, wall, monitor, floor) is identical in every
+# variant, so one environment capture serves all of them.
+SCENES = ("default", "two_cylinders", "moving_cylinder")
+
+# Positions are given in the ROBOT's frame (base_link: x forward from the
+# base, y to its left), then converted below -- the base sits at
+# ROBOT_BASE_XY, yawed 180 deg (ur5e.xml's base quat="0 0 0 -1"), so
+# world = (ROBOT_BASE_XY[0] - x, ROBOT_BASE_XY[1] - y).
+# Keep in sync with class_regions in rmp2_ros' sim_startup.launch, which
+# labels each cylinder by these same base_link positions.
+CYLINDER_RADIUS = 0.05
+CYLINDER_HALF_HEIGHT = 0.25
+CYLINDER_SPECS = [
+    dict(name="cylinder_left",  base_xy=(0.50, 0.25),  rgba="0.85 0.35 0.30 1"),
+    dict(name="cylinder_right", base_xy=(0.50, -0.25), rgba="0.30 0.55 0.85 1"),
+]
+# "moving_cylinder" adds a third cylinder, a MOCAP body: the ROS node sets its
+# pose before every step from moving_cylinder_world_pos(sim time), so physics
+# never moves it. It sweeps in base_link y at fixed base_link x.
+MOVING_CYLINDER_X = 0.65            # base_link x (forward from the base), m
+MOVING_CYLINDER_AMPLITUDE = 0.35    # base_link y swing, +/- m
+MOVING_CYLINDER_PERIOD = 12.0       # sim-time seconds per full sweep
+
+
+def _cylinder_world_xy(base_xy):
+    return ROBOT_BASE_XY[0] - base_xy[0], ROBOT_BASE_XY[1] - base_xy[1]
+
+
+def moving_cylinder_world_pos(t):
+    """World-frame (x, y, z) of the moving cylinder at sim time t (seconds)."""
+    base_y = MOVING_CYLINDER_AMPLITUDE * np.sin(2.0 * np.pi * t / MOVING_CYLINDER_PERIOD)
+    x, y = _cylinder_world_xy((MOVING_CYLINDER_X, base_y))
+    return np.array([x, y, CYLINDER_HALF_HEIGHT], dtype=float)
+
+
+def _cylinders_xml(group):
+    # Static (no freejoint) and contype/conaffinity 0: the arm passes
+    # through instead of knocking them over, so a collision shows up as
+    # penetration and the cylinders (and their labels) never move.
+    out = []
+    for spec in CYLINDER_SPECS:
+        x, y = _cylinder_world_xy(spec["base_xy"])
+        out.append(f"""
+    <body name="{spec['name']}" pos="{x:.4f} {y:.4f} {CYLINDER_HALF_HEIGHT:.4f}">
+      <geom name="{spec['name']}_geom" type="cylinder" group="{group}"
+            contype="0" conaffinity="0"
+            size="{CYLINDER_RADIUS:.4f} {CYLINDER_HALF_HEIGHT:.4f}" rgba="{spec['rgba']}"/>
+    </body>""")
+    return "".join(out)
+
+
+def _moving_cylinder_xml(group):
+    # Mocap body: must be a direct child of worldbody and carry no joint.
+    # Its pose at compile time is the t=0 pose; the node overwrites
+    # data.mocap_pos every step.
+    x, y, z = moving_cylinder_world_pos(0.0)
+    return f"""
+    <body name="cylinder_moving" mocap="true" pos="{x:.4f} {y:.4f} {z:.4f}">
+      <geom name="cylinder_moving_geom" type="cylinder" group="{group}"
+            contype="0" conaffinity="0"
+            size="{CYLINDER_RADIUS:.4f} {CYLINDER_HALF_HEIGHT:.4f}" rgba="0.30 0.80 0.35 1"/>
+    </body>"""
+
 
 # ----------------------------------------------------------------------
 # Human figure, reaching for the bottle without touching it. Built as a
@@ -527,7 +596,7 @@ def _car_xml(group):
 
 
 def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
-                     offwidth=None, offheight=None) -> str:
+                     offwidth=None, offheight=None, scene: str = "default") -> str:
     """Return the full workcell MJCF as a string.
 
     See the module docstring for why this deliberately emits NO <compiler>
@@ -540,7 +609,10 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
     size on the <global> visual tag -- required whenever a caller will build
     a mujoco.Renderer larger than MuJoCo's 640x480 default (see
     mujoco_rgbd_node.build_scene for the same override and why).
+    scene picks the variant from SCENES; only the clutter differs.
     """
+    if scene not in SCENES:
+        raise ValueError(f"unknown scene {scene!r}, expected one of {SCENES}")
     slab_half_z = SLAB_THICKNESS / 2
     slab_center_z = -slab_half_z
     legs_xml = _legs_xml(TABLE_LENGTH, TABLE_WIDTH, TABLE_HEIGHT,
@@ -572,6 +644,45 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
     # Full-length "home" keyframe: 6 robot angles + one (pos, identity quat)
     # 7-vector per freejoint body, in worldbody declaration order -- see the
     # module docstring for why the vendored keyframe cannot simply be reused.
+    if scene in ("two_cylinders", "moving_cylinder"):
+        human_slot_xml = ""
+        clutter_xml = _cylinders_xml(GROUP_CLUTTER)
+        if scene == "moving_cylinder":
+            clutter_xml += _moving_cylinder_xml(GROUP_CLUTTER)
+    else:
+        human_slot_xml = f"""
+    <!-- Human figure reaching for the bottle; pose via the HUMAN_* constants. -->
+{human_xml}"""
+        clutter_xml = f"""
+    <!-- Drinking glass: one cylinder, free to be nudged by the arm. -->
+    <body name="glass" pos="{GLASS_POS_XY[0]:.4f} {GLASS_POS_XY[1]:.4f} {GLASS_HALF_HEIGHT:.4f}">
+      <freejoint/>
+      <geom name="glass_geom" type="cylinder" group="{GROUP_CLUTTER}"
+            size="{GLASS_RADIUS:.4f} {GLASS_HALF_HEIGHT:.4f}" rgba="{GLASS_RGBA}"/>
+    </body>
+
+    <!-- Bottle: body cylinder + a narrower neck cylinder, one rigid body. -->
+    <body name="bottle" pos="{bottle_x:.4f} {bottle_y:.4f} {BOTTLE_BODY_HALF_HEIGHT:.4f}">
+      <freejoint/>
+      <geom name="bottle_body_geom" type="cylinder" group="{GROUP_CLUTTER}"
+            size="{BOTTLE_BODY_RADIUS:.4f} {BOTTLE_BODY_HALF_HEIGHT:.4f}" rgba="{BOTTLE_RGBA}"/>
+      <geom name="bottle_neck_geom" type="cylinder" group="{GROUP_CLUTTER}"
+            pos="0 0 {bottle_neck_center_z - BOTTLE_BODY_HALF_HEIGHT:.4f}"
+            size="{BOTTLE_NECK_RADIUS:.4f} {BOTTLE_NECK_HALF_HEIGHT:.4f}" rgba="{BOTTLE_RGBA}"/>
+    </body>
+{blocks_xml}
+{composites_xml}
+
+    <!-- ChArUco board: hardcoded pose from the real rig's poses.yaml
+         (aruco_1, parent base_link == this world origin). NOT a freejoint --
+         a calibration target is bolted at a known, fixed transform. -->
+    <body name="charuco_board" pos="{BOARD_POS[0]} {BOARD_POS[1]} {BOARD_POS[2]}"
+          quat="{BOARD_QUAT_WXYZ[0]} {BOARD_QUAT_WXYZ[1]:.16f} {BOARD_QUAT_WXYZ[2]:.16f} {BOARD_QUAT_WXYZ[3]}">
+      <geom name="charuco_geom" type="box" group="{GROUP_CLUTTER}"
+            size="{BOARD_WIDTH / 2:.4f} {BOARD_DEPTH / 2:.4f} {BOARD_THICKNESS / 2:.4f}"
+            material="charuco_mat"/>
+    </body>"""
+
     keyframe_xml = ""
     if include_robot:
         identity = (1, 0, 0, 0)
@@ -584,6 +695,8 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
             (*SCREWDRIVER_POS_XY, SCREWDRIVER_HANDLE_HALF_W, identity),
             (*CAR_POS_XY, CAR_WHEEL_RADIUS, tuple(_car_quat())),
         ]
+        if scene != "default":
+            free_body_home = []   # the other variants have no freejoint bodies
         free_qpos = " ".join(
             f"{x:.4f} {y:.4f} {z:.4f} " + " ".join(f"{v:.6f}" for v in q)
             for x, y, z, q in free_body_home
@@ -651,43 +764,14 @@ def build_scene_xml(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
             rgba="{MONITOR_RGBA}"/>
     </body>
 
-    <!-- Human figure reaching for the bottle; pose via the HUMAN_* constants. -->
-{human_xml}
+{human_slot_xml}
 
     <site name="robot_mount" pos="{ROBOT_BASE_XY[0]} {ROBOT_BASE_XY[1]} 0" size="0.035" rgba="0.9 0.2 0.2 1"/>
 
     <camera name="depth_cam" pos="{CAMERA_POS[0]} {CAMERA_POS[1]} {CAMERA_POS[2]}"
             fovy="{camera_fovy}" mode="targetbody" target="table"/>
 
-    <!-- Drinking glass: one cylinder, free to be nudged by the arm. -->
-    <body name="glass" pos="{GLASS_POS_XY[0]:.4f} {GLASS_POS_XY[1]:.4f} {GLASS_HALF_HEIGHT:.4f}">
-      <freejoint/>
-      <geom name="glass_geom" type="cylinder" group="{GROUP_CLUTTER}"
-            size="{GLASS_RADIUS:.4f} {GLASS_HALF_HEIGHT:.4f}" rgba="{GLASS_RGBA}"/>
-    </body>
-
-    <!-- Bottle: body cylinder + a narrower neck cylinder, one rigid body. -->
-    <body name="bottle" pos="{bottle_x:.4f} {bottle_y:.4f} {BOTTLE_BODY_HALF_HEIGHT:.4f}">
-      <freejoint/>
-      <geom name="bottle_body_geom" type="cylinder" group="{GROUP_CLUTTER}"
-            size="{BOTTLE_BODY_RADIUS:.4f} {BOTTLE_BODY_HALF_HEIGHT:.4f}" rgba="{BOTTLE_RGBA}"/>
-      <geom name="bottle_neck_geom" type="cylinder" group="{GROUP_CLUTTER}"
-            pos="0 0 {bottle_neck_center_z - BOTTLE_BODY_HALF_HEIGHT:.4f}"
-            size="{BOTTLE_NECK_RADIUS:.4f} {BOTTLE_NECK_HALF_HEIGHT:.4f}" rgba="{BOTTLE_RGBA}"/>
-    </body>
-{blocks_xml}
-{composites_xml}
-
-    <!-- ChArUco board: hardcoded pose from the real rig's poses.yaml
-         (aruco_1, parent base_link == this world origin). NOT a freejoint --
-         a calibration target is bolted at a known, fixed transform. -->
-    <body name="charuco_board" pos="{BOARD_POS[0]} {BOARD_POS[1]} {BOARD_POS[2]}"
-          quat="{BOARD_QUAT_WXYZ[0]} {BOARD_QUAT_WXYZ[1]:.16f} {BOARD_QUAT_WXYZ[2]:.16f} {BOARD_QUAT_WXYZ[3]}">
-      <geom name="charuco_geom" type="box" group="{GROUP_CLUTTER}"
-            size="{BOARD_WIDTH / 2:.4f} {BOARD_DEPTH / 2:.4f} {BOARD_THICKNESS / 2:.4f}"
-            material="charuco_mat"/>
-    </body>
-
+{clutter_xml}
   </worldbody>
 {keyframe_xml}
 </mujoco>
@@ -727,7 +811,7 @@ def _compile_model(xml: str, include_robot: bool) -> mujoco.MjModel:
 
 
 def compile_scene_model(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
-                         offwidth=None, offheight=None) -> mujoco.MjModel:
+                         offwidth=None, offheight=None, scene: str = "default") -> mujoco.MjModel:
     """Build AND compile the workcell in one call -- the entry point other
     scripts should use.
 
@@ -737,7 +821,7 @@ def compile_scene_model(include_robot: bool = True, camera_fovy=CAMERA_FOVY,
     meshes. _compile_model handles that.
     """
     xml = build_scene_xml(include_robot=include_robot, camera_fovy=camera_fovy,
-                           offwidth=offwidth, offheight=offheight)
+                           offwidth=offwidth, offheight=offheight, scene=scene)
     return _compile_model(xml, include_robot)
 
 
